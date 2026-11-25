@@ -1,0 +1,17 @@
+# The MCU's sketch is built and flashed with arduino-cli (README, "Install"), not
+# by App Lab: App Lab can only build in the core's dynamic mode, where the code
+# runs from the 256 KB sketch RAM and this sketch (~400 KB) does not fit.
+# link_mode=static: the code runs from the 768 KB flash partition.
+# wait_linux_boot=no: the sketch starts at power-on (the boot screen), not
+# after Linux.
+profiles:
+  default:
+    fqbn: arduino:zephyr:unoq:link_mode=static,wait_linux_boot=no
+    platforms:
+      - platform: arduino:zephyr
+    libraries:
+      - MsgPack (0.4.2)
+      - DebugLog (0.8.4)
+      - ArxContainer (0.7.0)
+      - ArxTypeTraits (0.3.2)
+default_profile: default

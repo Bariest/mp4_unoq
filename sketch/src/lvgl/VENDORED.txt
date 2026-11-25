@@ -1,0 +1,1 @@
+LVGL 9.5.0, copied by tools/vendor_lvgl.py: 104 .c, 276 .h

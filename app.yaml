@@ -1,0 +1,6 @@
+name: Mini Pupper UNO Q
+icon: 🐕
+description: Mini Pupper on the UNO Q carrier board, running firmware-dev's ESP32-S3 code and web app (moves, calibration, Servo Studio, LCD face and GIFs, IMU, battery, RL policies).
+
+bricks:
+  - arduino:web_ui
