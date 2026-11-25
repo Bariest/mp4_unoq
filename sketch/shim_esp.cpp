@@ -781,6 +781,47 @@ bool mpx_nvs_load(const char *key, uint8_t type, const void *v, size_t n)
     return nvs_put(key, type, v, n, false) != nullptr;
 }
 
+/* the whole table as bytes, for the copy in the MCU's flash (nvs_cache.cpp):
+ * [u16 count] then per entry [key 32][type][len][value len] */
+size_t mpx_nvs_snapshot(uint8_t *buf, size_t max)
+{
+    Guard g(s_nvs_lock);
+    if (max < 2) return 0;
+    size_t o = 2;
+    uint16_t count = 0;
+    for (int i = 0; i < s_nvs_n; ++i) {
+        const NvsEntry &e = s_nvs[i];
+        if (o + NVS_KEY + 2 + e.len > max) break;
+        memcpy(buf + o, e.key, NVS_KEY); o += NVS_KEY;
+        buf[o++] = e.type;
+        buf[o++] = e.len;
+        memcpy(buf + o, e.v, e.len); o += e.len;
+        ++count;
+    }
+    buf[0] = (uint8_t)count;
+    buf[1] = (uint8_t)(count >> 8);
+    return o;
+}
+
+bool mpx_nvs_restore(const uint8_t *buf, size_t n)
+{
+    if (n < 2) return false;
+    const unsigned count = buf[0] | (buf[1] << 8);
+    size_t o = 2;
+    Guard g(s_nvs_lock);
+    for (unsigned i = 0; i < count; ++i) {
+        if (o + NVS_KEY + 2 > n) return false;
+        char key[NVS_KEY];
+        memcpy(key, buf + o, NVS_KEY); o += NVS_KEY;
+        key[NVS_KEY - 1] = 0;
+        const uint8_t type = buf[o++], len = buf[o++];
+        if (o + len > n || len > NVS_VAL) return false;
+        nvs_put(key, type, buf + o, len, false);
+        o += len;
+    }
+    return true;
+}
+
 bool mpx_nvs_take_dirty(char *key, size_t keylen, uint8_t *type, uint8_t *v, size_t *n)
 {
     Guard g(s_nvs_lock);

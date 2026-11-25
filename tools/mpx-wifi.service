@@ -1,0 +1,16 @@
+# Mini Pupper UNO Q: the board's Wi-Fi for the robot app (tools/mpx_wifi.py).
+# Install once on the board (README, "Wi-Fi"):
+#   sudo cp ~/ArduinoApps/mpx_unoq/tools/mpx-wifi.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now mpx-wifi
+[Unit]
+Description=Mini Pupper UNO Q Wi-Fi helper (AP when there is no network, the app's Wi-Fi page)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+ExecStart=/usr/bin/python3 /home/arduino/ArduinoApps/mpx_unoq/tools/mpx_wifi.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

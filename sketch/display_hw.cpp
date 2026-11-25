@@ -51,7 +51,11 @@ volatile bool s_boot_dirty;
 constexpr uint8_t ST_CASET = 0x2A, ST_RASET = 0x2B, ST_RAMWR = 0x2C, ST_MADCTL = 0x36, ST_COLMOD = 0x3A,
                   ST_SLPOUT = 0x11, ST_INVON = 0x21, ST_INVOFF = 0x20, ST_DISPON = 0x29, ST_DISPOFF = 0x28, ST_SWRESET = 0x01;
 constexpr uint8_t MAD_MY = 0x80, MAD_MX = 0x40, MAD_MV = 0x20;
-constexpr bool BASE_SWAP_XY = true, BASE_MIRROR_X = true, BASE_MIRROR_Y = false, PANEL_INVERT = true;
+/* Base orientation of this robot's LCD: turned 180 degrees from the first build
+ * (that was MIRROR_X = true, MIRROR_Y = false, which reads upside down on this
+ * robot). The boot screen and the face both start from it; the app's Display
+ * page "turn 180" still flips the face from here. */
+constexpr bool BASE_SWAP_XY = true, BASE_MIRROR_X = false, BASE_MIRROR_Y = true, PANEL_INVERT = true;
 
 /* ── SPI1 by its registers ─────────────────────────────────────────────── */
 #if defined(ARDUINO_UNO_Q)

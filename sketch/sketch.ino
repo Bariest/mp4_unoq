@@ -14,8 +14,12 @@
  * config, current caps) and streams the TrajOpt / Character move rows, which do
  * not fit in this chip's sketch space.
  *
- * Boot: the servos stay limp until Linux has sent the saved settings (mp_nvs ...
- * mp_nvs_done), so the robot never stands up on default calibration. Then
+ * Boot: the robot starts from the saved settings. A copy of them is kept in the
+ * MCU's own flash (nvs_cache.cpp), so after a power-on the robot stands up at
+ * once, before Linux has booted; Linux then sends its copy (mp_nvs ...
+ * mp_nvs_done), and a difference is written to the flash for the next start.
+ * With no copy in the flash yet (a new board) the servos stay limp until Linux
+ * has sent the settings, so the robot never stands up on default calibration. Then
  * robot::init() runs as on the ESP: boards found, range read, soft start to the
  * stand.
  */
@@ -28,6 +32,9 @@
 
 #include "shim_esp.h"
 #include "mpx_glue.h"
+#include "nvs_cache.h"
+#include "imu_remap.h"
+#include "mpx_robot.h"
 #include "driver_board.h"
 #include "mcu_http.h"
 #include "spi_port.h"
@@ -36,7 +43,7 @@
 #include "gif_store.h"
 #include "net_status.h"
 
-#define MPX_FW_VERSION 5       /* 5 = firmware-dev: carrier board, face, IMU, battery (4 = mpv2onlyRL moves) */
+#define MPX_FW_VERSION 6       /* 6 = settings copy in the MCU flash, stands before Linux; 5 = firmware-dev port */
 
 /* The Bridge to Linux. 460800, not the core's 115200: the face's GIFs and the
  * RL policy's observations need the room. The router on Linux must run at the
@@ -46,6 +53,9 @@
 #define HTTP_CHUNK 180         /* Bridge messages are 256 bytes */
 
 static volatile bool g_nvs_done = false;
+/* where the settings came from: 0 none yet, 1 Linux, 2 the copy in the MCU's flash */
+static volatile int  g_nvs_src = 0;
+static volatile bool g_cache_check = false;   /* compare the table with the flash copy */
 static volatile bool g_started = false;
 static uint32_t g_http_count = 0;
 static std::string g_resp;     /* the reply being fetched in chunks (one request at a time) */
@@ -74,7 +84,7 @@ String mp_hello()
     snprintf(b, sizeof b,
              "fw=%d;started=%d;nvs=%d;scale=%d;probed=%d;boards=%d;spi_khz=%lu;edge=%d;mosi=%lu;frames=%lu;"
              "http=%lu;fmt=%s;mode=%s;imu=%d;lcd=%d;lcd_khz=%lu;lcd_frames=%lu;gif=%s;heap=%lu",
-             MPX_FW_VERSION, g_started ? 1 : 0, g_nvs_done ? 1 : 0,
+             MPX_FW_VERSION, g_started ? 1 : 0, (int)g_nvs_src,
              (int)driver_board_get_scale_dd(), driver_board_probe_answered() ? 1 : 0,
              g_started ? (int)(driver_board_present_fresh(1) + driver_board_present_fresh(4) +
                                driver_board_present_fresh(7) + driver_board_present_fresh(10)) : 0,
@@ -131,7 +141,9 @@ bool mp_nvs(String key, String type, Bin v)
 
 bool mp_nvs_done()
 {
+    g_nvs_src = 1;
     g_nvs_done = true;
+    g_cache_check = true;           /* keep the flash copy the same as Linux's */
     return true;
 }
 
@@ -155,6 +167,24 @@ bool mp_net(bool connected, String ip, String ssid)
     }
     return true;
 }
+
+/* the IMU's mounting (imu_remap.h): the map, the last raw accel and what the robot
+ * reads after the map, for /unoq/imu (python/esp_api.py) */
+String mp_imu()
+{
+    int8_t m[3];
+    mpx_imu_map_get(m);
+    float raw[3];
+    mpx_imu_raw_last(raw);
+    mpx_robot_imu_t d = {};
+    mpx_robot_imu_read(&d);
+    char b[200];
+    snprintf(b, sizeof b, "map=%d,%d,%d;raw=%.3f,%.3f,%.3f;acc=%.3f,%.3f,%.3f;gyr=%.1f,%.1f,%.1f",
+             m[0], m[1], m[2], raw[0], raw[1], raw[2], d.ax, d.ay, d.az, d.gx, d.gy, d.gz);
+    return String(b);
+}
+
+bool mp_imu_map(int a, int b, int c) { return mpx_imu_map_set(a, b, c); }
 
 /* servo-bus tuning (edge 0..3 or -1, kHz or 0) */
 String mp_spi(int edge, int khz)
@@ -240,7 +270,7 @@ static void wait_for_router()
          * reset the MCU once the same way. The reset-flags register says whether
          * that was already tried (SFTRSTF stays set until the next power-on). */
         const uint32_t SFTRSTF = 1u << 28;
-        if (rounds >= 30 && heard == 0 && !(rd32(0x46020C00UL + 0xF4) & SFTRSTF)) {
+        if (rounds >= 30 && heard == 0 && !g_started && !(rd32(0x46020C00UL + 0xF4) & SFTRSTF)) {
             display_hw_boot_status("No answer from Linux: restarting the MCU once");
             delay(1500);
             __asm volatile("dsb");
@@ -255,10 +285,21 @@ void setup()
     /* The screen first: it shows the boot while Linux starts (~1 min). */
     display_hw_init();
     display_hw_boot_status("Linux is starting");
+
+    /* the settings copy in the MCU's flash: stand up now, Linux follows */
+    if (nvs_cache_load()) {
+        g_nvs_src = 2;
+        g_nvs_done = true;
+        mpx_glue_start();              /* robot, battery, face (mpx_glue.cpp) */
+        g_started = true;
+    }
+
     wait_for_router();                 /* returns once the router on Linux answers */
     Bridge.begin(MPX_BRIDGE_BAUD);
     display_hw_boot_status("Linux is up - waiting for the robot app");
     Bridge.provide("mp_hello", mp_hello);
+    Bridge.provide("mp_imu", mp_imu);
+    Bridge.provide("mp_imu_map", mp_imu_map);
     Bridge.provide("mp_http", mp_http);
     Bridge.provide("mp_http_more", mp_http_more);
     Bridge.provide("mp_nvs", mp_nvs);
@@ -291,6 +332,17 @@ void loop()
         Bin b;
         for (size_t i = 0; i < n; ++i) b.push_back(v[i]);
         Bridge.notify("mp_nvs_save", String(key), String(t), b);
+        g_cache_check = true;
+    }
+
+    /* the flash copy of the settings: rewritten when the table changed (at most every 3 s) */
+    static uint32_t last_cache = 0;
+    if (g_cache_check && g_started && millis() - last_cache >= 3000) {
+        last_cache = millis();
+        g_cache_check = false;
+        const int r = nvs_cache_save();
+        if (r > 0) Bridge.notify("mp_log", String("settings: copy in the MCU flash updated"));
+        else if (r < 0) Bridge.notify("mp_log", String("settings: could not write the copy in the MCU flash"));
     }
 
     /* log lines */

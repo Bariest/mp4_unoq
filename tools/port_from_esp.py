@@ -22,7 +22,7 @@ it again:
   * the robot and Servo Studio routes of http_server.cc become mcu_http_routes_inc.h,
     served over the Bridge (mcu_http.cpp) so their JSON is byte-for-byte the ESP's.
 
-Hand-written files (shim_esp.*, spi_port.cpp, imu_port.cpp, mcu_http.cpp,
+Hand-written files (shim_esp.*, spi_port.cpp, imu_port.cpp, imu_remap.*, nvs_cache.*, mcu_http.cpp,
 tj_stream.*, board_config.h, mpx_math.h, sketch.ino) are not touched.
 """
 import os
@@ -136,6 +136,11 @@ def port_robot(esp):
         assert h in t, h
         t = t.replace(h, '#include "shim_i2c.h"')
     t = plumb(t)
+    # this carrier board can hold the BMI270 turned: every sample into the ESP board's frame (imu_remap.h)
+    t = t.replace('#include "shim_i2c.h"', '#include "shim_i2c.h"\n#include "imu_remap.h"   /* port_from_esp.py */', 1)
+    fresh = "            /* Freshness for the gait loop's reflexes"
+    assert t.count(fresh) == 1, "imu.cc: the sample's freshness comment moved"
+    t = t.replace(fresh, "            imu_board_remap(sample);   /* port_from_esp.py: carrier board -> ESP board frame */\n\n" + fresh, 1)
     write("imu.cpp", HEADER_NOTE.format(src="main/robot/imu.cc") + with_math(t))
 
     # ---- robot.cc: plumbing; the gait task gets a Zephyr thread through the shim

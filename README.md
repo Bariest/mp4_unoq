@@ -50,11 +50,34 @@ This app makes the UNO Q (on its carrier board, `Arduino_UNO_Q_EXT`) run the
    It starts the app, waits until the app reaches the MCU, and only if it does
    not within a minute flashes the MCU again (`~/app_autostart.log` ends with
    "ready after start" when all went well). The face is up ~1 min after power-on.
-5. Calibration and settings live on the board, in `~/ArduinoApps/mpx_unoq/nvs.json`.
+5. Wi-Fi like the ESP (once): the robot opens its own network when it has none,
+   and the web app's Wi-Fi page can scan / join / forget networks:
+
+       sudo apt install -y dnsmasq-base      # usually there already
+       sudo cp ~/ArduinoApps/mpx_unoq/tools/mpx-wifi.service /etc/systemd/system/
+       sudo systemctl daemon-reload && sudo systemctl enable --now mpx-wifi
+
+   With no saved Wi-Fi a minute after power-on (or when it drops for 30 s) the
+   board opens the open network **MPX-Dog-XXXXXX** (XXXXXX: the board's machine-id, the same every boot) at 192.168.2.1;
+   the screen shows "join MPX-Dog-XXXXXX 192.168.2.1". Join it with a phone, open
+   http://192.168.2.1, and pick your Wi-Fi in Settings -> Wi-Fi. The AP goes down
+   while the board joins (your phone drops off it); once joined, the screen shows
+   the new address. A wrong password brings the AP back. With nobody on the AP for
+   3 minutes it tries the saved networks again. Logs: `journalctl -u mpx-wifi`.
+6. Calibration and settings live on the board, in `~/ArduinoApps/mpx_unoq/nvs.json`.
    Keep a copy on the PC (`scp arduino@<IP>:/home/arduino/ArduinoApps/mpx_unoq/nvs.json .`)
    and copy it back to a new board before the first start.
 
 ## Power-on: the screen and the web app
+
+The robot stands up first: the MCU keeps a copy of the saved settings in its own
+flash (`sketch/nvs_cache.cpp`, the core's storage partition), so a few seconds
+after power-on the servos come up and the eyes appear, while Linux is still
+booting. When the app connects it sends Linux's settings; a difference is written
+to that copy and used from the next start. A new board has no copy yet: there the
+servos wait for Linux the first time, and stand up at once from then on. The web
+app and RL need Linux, so they are there about a minute later, as before.
+
 
 The sketch is in the MCU's flash, so the screen comes up at once, before Linux:
 "Mini Pupper / Linux is starting" with the seconds counting. Then:
@@ -133,6 +156,11 @@ observation goes over the Bridge.
 - `http://<board>:7000/unoq/hello` - the sketch: version, boards, SPI, IMU, LCD, GIF, free RAM.
 - `http://<board>:7000/unoq/log` - the robot's log lines (the ESP's serial log).
 - `http://<board>:7000/unoq/spi?edge=1&khz=4000` - servo bus clock / edge, live.
+- `http://<board>:7000/unoq/imu` - the IMU: the mounting map, raw and mapped accel, and a check
+  ("reads upright" when the robot stands flat). The robot reads the IMU in firmware-dev's ESP
+  board frame; if this carrier holds the chip another way, teach it the map with two poses:
+  `/unoq/imu/learn?pose=flat` (standing flat, still), then `/unoq/imu/learn?pose=nose_down`
+  (back lifted, nose down 30-45 deg). It is saved (`imu.map`); `/unoq/imu/map?m=1,2,3` sets it by hand.
 
 ## Updating from firmware-dev
 

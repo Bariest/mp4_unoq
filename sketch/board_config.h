@@ -48,6 +48,13 @@
 #define IMU_BMI270_I2C_ADDR     mpx_bmi270_addr()   /* 0x68 (SDO low), or 0x69 if only that answers */
 #define IMU_BMM150_I2C_ADDR     0x10     /* 7-bit, on the BMI270 aux bus */
 #define IMU_INT1_PIN            3
+/* The BMI270's mounting on this carrier board, into firmware-dev's ESP board frame
+ * (imu_remap.h): out = sign * raw[axis], per output axis x, y, z. This carrier holds
+ * the chip turned 180 degrees about y (learned 2026-11-25 with /unoq/imu/learn: standing
+ * flat raw z = +1 g, nose down raw y negative). A saved "imu.map" overrides it. */
+#define IMU_MAP_X               (-1)
+#define IMU_MAP_Y               2
+#define IMU_MAP_Z               (-3)
 
 /* LCD: ST7789 320x240 on the J1 FPC, SPI1 of the STM32U585 (display_hw.cpp):
  * A0 = PA4 (CS), A1 = PA5 (SCK), A2 = PA6 (MISO, unused), A3 = PA7 (MOSI);

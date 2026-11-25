@@ -37,6 +37,7 @@
 
 #include "shim_esp.h"
 #include "shim_i2c.h"
+#include "imu_remap.h"   /* port_from_esp.py */
 #include "shim_esp.h"
 #include "shim_esp.h"
 #include "shim_esp.h"
@@ -324,6 +325,8 @@ void imu_task(void *arg) {
                     sample.mag_valid = true;
                 }
             }
+
+            imu_board_remap(sample);   /* port_from_esp.py: carrier board -> ESP board frame */
 
             /* Freshness for the gait loop's reflexes (alive.c): seq bumps once
              * per sample, t_us is the esp_timer time it was taken. */

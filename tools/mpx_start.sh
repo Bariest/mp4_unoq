@@ -3,6 +3,7 @@
 # The sketch reaches Linux by itself after a power-on; the flash at the end is
 # only for the case where Linux restarted while the MCU kept running.
 APP=/home/arduino/ArduinoApps/mpx_unoq
+# (the address under the eyes and the Wi-Fi: tools/mpx_wifi.py, the mpx-wifi service)
 running() { arduino-app-cli app ps 2>/dev/null | grep -q "mpx_unoq running"; }
 ok()      { curl -s -m 3 http://127.0.0.1:7000/unoq/hello | grep -q '"fw"'; }
 # start the app as soon as Linux can run it (retry every 2 s, up to 1 min)

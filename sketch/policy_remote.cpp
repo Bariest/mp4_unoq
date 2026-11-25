@@ -88,6 +88,13 @@ extern "C" void mpx_pol_remote_forward(const pol_net_t *net, const float *obs, f
     int flag = F_PUSH;
     Shadow *sh = nullptr;
 
+    /* the robot can run before Linux is up (settings from the MCU's flash):
+     * no network to ask yet -> NaN, the runner stops as for a bad output */
+    if (!Bridge.is_started()) {
+        for (int i = 0; i < POL_ACT; ++i) act[i] = NAN;
+        return;
+    }
+
     if (L <= 1) {
         memcpy(newest, obs, sizeof newest);
     } else {

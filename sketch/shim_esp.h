@@ -230,6 +230,8 @@ esp_err_t nvs_get_blob(nvs_handle_t h, const char *key, void *v, size_t *n);
 /* the Linux side of the store (sketch.ino / shim_esp.cpp) */
 bool      mpx_nvs_load(const char *key, uint8_t type, const void *v, size_t n);   /* type 'i' or 'b' */
 bool      mpx_nvs_take_dirty(char *key, size_t keylen, uint8_t *type, uint8_t *v, size_t *n);
+size_t    mpx_nvs_snapshot(uint8_t *buf, size_t max);                           /* the table as bytes */
+bool      mpx_nvs_restore(const uint8_t *buf, size_t n);                        /* ... and back */
 bool      mpx_log_take(char *line, size_t n);
 
 /* ── gpio / SPI: what driver_board.c's boot check uses (spi_port.cpp) ──────

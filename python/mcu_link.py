@@ -13,6 +13,7 @@ HTTP handlers (sketch/mcu_http.cpp). This module:
     passes its requests for a GIF to display_api.py (mp_gif_want).
 """
 import collections
+import json
 import os
 import queue
 import socket
@@ -22,7 +23,7 @@ import time
 
 from arduino.app_utils import Bridge
 
-FW_EXPECTED = 5
+FW_EXPECTED = 6
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -104,16 +105,68 @@ class McuLink:
         self._tj_q.put((int(table), int(next_row), int(space)))
 
     # ── the address under the eyes ────────────────────────────────────────
-    def _send_net(self, force=False):
-        ip = ""
+    @staticmethod
+    def _docker_ip(ip):
+        """172.16.0.0/12: App Lab's Docker networks, not the board's Wi-Fi / Ethernet address"""
         try:
-            sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sk.connect(("10.255.255.255", 1))
-            ip = sk.getsockname()[0]
-            sk.close()
+            a, b = (int(x) for x in ip.split(".")[:2])
+        except ValueError:
+            return False
+        return a == 172 and 16 <= b <= 31
+
+    HOST_NET = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".host_net")
+
+    def _host_net(self):
+        """(ip, hostname) of the board itself, from .host_net in the app folder:
+        the start script (tools/mpx_start.sh) writes it every 10 s from the board's
+        own `hostname -I` and `hostname`, so it follows a Wi-Fi that comes up late
+        or a new address. ("", "") when there is no such file."""
+        try:
+            with open(self.HOST_NET) as f:
+                parts = f.read().split()
         except OSError:
-            pass
-        now = (bool(ip), ip + ":7000" if ip else "", socket.gethostname())
+            return "", ""
+        ip = parts[0] if parts and parts[0].count(".") == 3 else ""
+        name = parts[-1] if parts and parts[-1] != ip else ""     # "<ip> <name>", or " <name>" before the Wi-Fi is up
+        return ("" if self._docker_ip(ip) else ip), name
+
+    WIFI_STATE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".mpx_run", "wifi_state.json")
+
+    def _wifi_ap(self):
+        """the AP's name when the mpx-wifi service has it up (tools/mpx_wifi.py), else "" """
+        try:
+            with open(self.WIFI_STATE) as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            return ""
+        ap = st.get("ap", {})
+        return ap.get("ssid", "") if st.get("mode") == "ap" and time.time() - st.get("t", 0) < 30 else ""
+
+    def _send_net(self, force=False):
+        # This runs inside App Lab's container: its own socket address is the
+        # container's (172.x) and its hostname the container's id. The board's
+        # own come from .host_net (the start script), else App Lab's HOST_IP
+        # (fixed when the container started: empty if the Wi-Fi was not up yet).
+        ip, name = self._host_net()
+        if not ip:
+            env = os.environ.get("HOST_IP", "").strip()
+            ip = env.split(",")[0].split()[0] if env else ""
+        if not ip or self._docker_ip(ip):
+            ip = ""
+            try:
+                sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sk.connect(("10.255.255.255", 1))
+                ip = sk.getsockname()[0]
+                sk.close()
+            except OSError:
+                pass
+            if self._docker_ip(ip):
+                ip = ""                    # better no address than the container's
+        ap = self._wifi_ap()
+        if ap:                                # the board's own AP: "join MPX-Dog-XXXXXX 192.168.2.1"
+            now = (False, "", ap + " 192.168.2.1")
+        else:
+            now = (bool(ip), ip + ":7000" if ip else "", name or "the board's Wi-Fi")
         if force or now != self._net_last:
             try:
                 Bridge.call("mp_net", now[0], now[1], now[2], timeout=3)
@@ -136,7 +189,9 @@ class McuLink:
             if h.get("fw") != FW_EXPECTED:
                 self.log("WARNING: sketch fw %s, this python expects %d: run the app again so both match"
                          % (h.get("fw"), FW_EXPECTED))
-            if not h.get("nvs"):
+            # nvs: 0 = no settings yet, 2 = started from the copy in its flash
+            # (Linux's settings are sent anyway: a difference goes to that copy), 1 = ours
+            if h.get("nvs") != 1:
                 n = 0
                 for key, (typ, raw) in self.nvs.items():
                     try:
@@ -145,7 +200,9 @@ class McuLink:
                     except Exception as e:
                         self.log("could not give the sketch %s: %s" % (key, e))
                 Bridge.call("mp_nvs_done", timeout=3)
-                self.log("sketch fw %s: %d saved settings sent, robot starting" % (h.get("fw"), n))
+                self.log("sketch fw %s: %d saved settings sent, %s" % (h.get("fw"), n,
+                         "robot already standing (settings from the MCU flash)" if h.get("nvs") == 2
+                         else "robot starting"))
             # watch for a sketch restart (it would wait for the settings again)
             while True:
                 time.sleep(3.0)
@@ -156,7 +213,7 @@ class McuLink:
                 self._send_net()
                 self.hello = h
                 self.started = bool(h.get("started"))
-                if not h.get("nvs"):
+                if h.get("nvs") != 1:
                     self.log("the sketch restarted: sending the settings again")
                     break
 
@@ -209,3 +266,16 @@ class McuLink:
 
     def spi(self, edge=-1, khz=0):
         return parse_hello(Bridge.call("mp_spi", int(edge), int(khz), timeout=3))
+
+    # ── the IMU's mounting (sketch/imu_remap.h) ──────────────────────────
+    def imu(self):
+        """{"map": [3 ints], "raw": [ax, ay, az] g before the map, "acc": after it, "gyr": dps after it}"""
+        out = {}
+        for kv in str(Bridge.call("mp_imu", timeout=3)).split(";"):
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                out[k] = [int(x) if k == "map" else float(x) for x in v.split(",")]
+        return out
+
+    def imu_map(self, a, b, c):
+        return bool(Bridge.call("mp_imu_map", int(a), int(b), int(c), timeout=3))

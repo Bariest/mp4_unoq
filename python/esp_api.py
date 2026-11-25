@@ -5,10 +5,12 @@ calls the same routes it calls on the ESP. Here they are answered as follows:
 
   /v1/robot/*, /v1/studio/*   forwarded to the sketch, which runs the ESP's own
                               handler code (sketch/mcu_http.cpp): same JSON
-  /v1/wifi/status             this board's network, in the ESP's shape (no "pi"
-                              object: this robot has no Raspberry Pi link, and the
-                              app hides that section, as for any robot without one)
-  /v1/wifi/scan|connect|...   refused: the UNO Q's Wi-Fi is set up in App Lab
+  /v1/wifi/*                  the board's Wi-Fi, in the ESP's shapes: status, scan,
+                              connect, disconnect, forget, ap-config. Done by the
+                              mpx-wifi service on the board (tools/mpx_wifi.py):
+                              requests in .mpx_run/wifi_req.json, its state in
+                              .mpx_run/wifi_state.json. No "pi" object in status:
+                              this robot has no Raspberry Pi link
   /v1/system/stats            Linux CPU and memory, in sys_monitor.cc's shape
   /v1/agent/permissions       kept, as on the ESP
   /v1/chat/ui (WebSocket)     accepted and quiet: no AI agent on this robot yet
@@ -133,16 +135,94 @@ def register(app, link, settings, log, extra=()):
     async def studio_routes(request: Request, rest: str):
         return await forward(request, "studio/" + rest)
 
+    # ── Wi-Fi: the mpx-wifi service on the board does it (tools/mpx_wifi.py) ──
+    run_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".mpx_run")
+    wifi_state_path = os.path.join(run_dir, "wifi_state.json")
+    wifi_req_path = os.path.join(run_dir, "wifi_req.json")
+
+    def _wifi_state():
+        """the service's state, or None when it is not running (not installed)"""
+        try:
+            with open(wifi_state_path) as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            return None
+        return st if time.time() - st.get("t", 0) < 30 else None
+
+    def _wifi_ask(op, **kw):
+        rid = "%d" % (time.time() * 1000)
+        tmp = wifi_req_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"id": rid, "op": op, **kw}, f)
+        os.replace(tmp, wifi_req_path)
+        return rid
+
+    no_helper = {"ok": False, "error": "busy",
+                 "detail": "The board's Wi-Fi helper is not running: install the mpx-wifi service (README, Wi-Fi)"}
+
     @app.get("/v1/wifi/status")
     async def wifi_status(request: Request):
-        ip = request.url.hostname or _host_ip()
-        return _json({"ap": {"ssid": "", "ip": ""},
-                      "sta": {"state": "connected", "ssid": socket.gethostname(), "ip": ip}})
+        st = _wifi_state()
+        if st is None:
+            ip = request.url.hostname or _host_ip()
+            return _json({"ap": {"ssid": "", "ip": ""},
+                          "sta": {"state": "connected", "ssid": socket.gethostname(), "ip": ip, "error": ""}})
+        ap = st.get("ap", {})
+        return _json({"ap": {"ssid": ap.get("ssid", "") if ap.get("on") else "", "ip": ap.get("ip", "") if ap.get("on") else ""},
+                      "sta": st.get("sta", {})})
 
-    @app.api_route("/v1/wifi/{rest:path}", methods=["GET", "POST"])
-    async def wifi_other(rest: str):
-        return _json({"ok": False, "error": "busy",
-                      "detail": "The UNO Q's Wi-Fi is set up in Arduino App Lab, not from this app"})
+    @app.get("/v1/wifi/scan")
+    async def wifi_scan():
+        if _wifi_state() is None:
+            return _json(no_helper)
+        rid = _wifi_ask("scan")
+        for _ in range(60):                         # the radio takes a few seconds
+            await asyncio.sleep(0.5)
+            st = _wifi_state() or {}
+            if st.get("req_done") == rid:
+                return _json({"ok": True, "networks": st.get("scan", [])})
+        return _json({"ok": False, "error": "busy"})
+
+    async def _wifi_body(request):
+        try:
+            return await request.json()
+        except Exception:
+            return {}
+
+    @app.post("/v1/wifi/connect")
+    async def wifi_connect(request: Request):
+        b = await _wifi_body(request)
+        if not b.get("ssid"):
+            return Response("missing 'ssid' field", status_code=400)
+        if _wifi_state() is None:
+            return _json(no_helper)
+        _wifi_ask("connect", ssid=b["ssid"], password=b.get("password", ""), identity=b.get("identity", ""))
+        log("Wi-Fi: joining %s" % b["ssid"])
+        return _json({"ok": True})
+
+    @app.post("/v1/wifi/disconnect")
+    async def wifi_disconnect():
+        if _wifi_state() is None:
+            return _json(no_helper)
+        _wifi_ask("disconnect")
+        return _json({"ok": True})
+
+    @app.post("/v1/wifi/forget")
+    async def wifi_forget():
+        if _wifi_state() is None:
+            return _json(no_helper)
+        _wifi_ask("forget")
+        return _json({"ok": True})
+
+    @app.post("/v1/wifi/ap-config")
+    async def wifi_ap_config(request: Request):
+        b = await _wifi_body(request)
+        if not b.get("ssid"):
+            return Response("missing 'ssid' field", status_code=400)
+        if _wifi_state() is None:
+            return _json(no_helper)
+        _wifi_ask("ap-config", ssid=b["ssid"], password=b.get("password", ""))
+        return _json({"ok": True, "restarting": False})
 
     # the controller layout every browser of this robot shares (http_server.cc keeps it in NVS "ui")
     @app.get("/v1/settings/control-scheme")
@@ -204,6 +284,80 @@ def register(app, link, settings, log, extra=()):
     @app.get("/unoq/spi")
     async def unoq_spi(edge: int = -1, khz: int = 0):
         return _json({"ok": True, "hello": await asyncio.to_thread(link.spi, edge, khz)})
+
+    # ── the IMU's mounting: which way the BMI270 sits on this carrier board ──
+    # Everything on the robot reads the IMU in firmware-dev's ESP board frame:
+    # standing flat it reads acc about (0, 0, -1) g; nose down, acc y goes
+    # negative; left side down, acc x goes negative. /unoq/imu/learn finds the
+    # map from two poses (flat, then nose down) and saves it (imu.map).
+    imu_learn = {}
+
+    def _imu_avg(n=10):
+        s = [0.0, 0.0, 0.0]
+        for _ in range(n):
+            r = link.imu()["raw"]
+            for i in range(3):
+                s[i] += r[i] / n
+            time.sleep(0.05)
+        return [round(v, 3) for v in s]
+
+    def _imu_check(acc):
+        x, y, z = acc
+        if z < -0.8:
+            return "reads upright (acc z about -1 g): right when the robot stands flat"
+        k = max(range(3), key=lambda i: abs(acc[i]))
+        return ("NOT upright: gravity is on acc %s%s (should be on z, about -1 g, when the robot stands flat); "
+                "run /unoq/imu/learn?pose=flat, then ?pose=nose_down" % ("-" if acc[k] < 0 else "+", "xyz"[k]))
+
+    @app.get("/unoq/imu")
+    async def unoq_imu():
+        try:
+            d = await asyncio.to_thread(link.imu)
+        except Exception as e:
+            return _json({"ok": False, "error": str(e)})
+        return _json({"ok": True, **d, "check": _imu_check(d.get("acc", [0, 0, 0]))})
+
+    @app.get("/unoq/imu/map")
+    async def unoq_imu_map(m: str):
+        try:
+            a, b, c = (int(v) for v in m.split(","))
+        except ValueError:
+            return _json({"ok": False, "error": "m=x,y,z: each +-1, +-2 or +-3, e.g. m=1,2,3"})
+        ok = await asyncio.to_thread(link.imu_map, a, b, c)
+        return _json({"ok": ok, "map": [a, b, c]})
+
+    @app.get("/unoq/imu/learn")
+    async def unoq_imu_learn(pose: str):
+        raw = await asyncio.to_thread(_imu_avg)
+        if pose == "flat":
+            imu_learn["flat"] = raw
+            return _json({"ok": True, "pose": "flat", "raw": raw,
+                          "next": "lift the BACK of the robot so the nose points down about 30-45 deg, hold it "
+                                  "still, then open /unoq/imu/learn?pose=nose_down"})
+        if pose != "nose_down":
+            return _json({"ok": False, "error": "pose=flat first, then pose=nose_down"})
+        flat = imu_learn.get("flat")
+        if not flat:
+            return _json({"ok": False, "error": "do pose=flat first"})
+        k = max(range(3), key=lambda i: abs(flat[i]))
+        if abs(flat[k]) < 0.8:
+            return _json({"ok": False, "error": "flat reading %s: not lying level / still; do pose=flat again" % flat})
+        d = [raw[i] - flat[i] for i in range(3)]
+        j = max((i for i in range(3) if i != k), key=lambda i: abs(d[i]))
+        if abs(d[j]) < 0.25:
+            return _json({"ok": False, "error": "the nose is not down enough (change %s): tilt about 30-45 deg" % d})
+        sz = -1 if flat[k] > 0 else 1          # out z = sz * raw[k]  -> -1 g standing flat
+        sy = -1 if d[j] > 0 else 1             # out y = sy * raw[j]  -> negative nose down
+        Y = [0, 0, 0]; Y[j] = sy
+        Z = [0, 0, 0]; Z[k] = sz
+        X = [Y[1] * Z[2] - Y[2] * Z[1], Y[2] * Z[0] - Y[0] * Z[2], Y[0] * Z[1] - Y[1] * Z[0]]   # x = y cross z
+        i = max(range(3), key=lambda n: abs(X[n]))
+        m = [int(X[i]) * (i + 1), sy * (j + 1), sz * (k + 1)]
+        ok = await asyncio.to_thread(link.imu_map, *m)
+        log("IMU map learned: %s (flat %s, nose down %s)" % (m, flat, raw))
+        imu_learn.clear()
+        return _json({"ok": ok, "map": m, "flat": flat, "nose_down": raw,
+                      "next": "put it down flat: /unoq/imu should now say it reads upright"})
 
     @app.get("/unoq/log")
     async def unoq_log():
