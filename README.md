@@ -9,6 +9,96 @@ This app makes the UNO Q (on its carrier board, `Arduino_UNO_Q_EXT`) run the
 | MCU, RL | the RL runner: 200 Hz ticks, observations, history, decoder, every guard and stop rule, get-up, keep up, stairs, the `/v1/policy` handlers | `main/rl/policy_run.cc`, `policy_core.c`, `main/network/http_policy.cc` |
 | Linux (`python/`) | the web server, the saved settings (`nvs.json`), the TrajOpt / Character move rows, the GIF files of the Display page, **the RL networks** (`policy_net.py`, numpy), Wi-Fi and system pages | `www/` (served unchanged from `assets/`), `main/rl/policies/*.mpxp` |
 
+## Architecture: what runs where
+
+Three chips, two of them working. The **STM32U585 MCU** does everything with a
+deadline; the **Qualcomm QRB2210 (Linux)** does everything that needs room or a
+network; the MP4 board's own **ESP32-S3 is idle**. The two working sides talk only
+over the Bridge.
+
+```
+  Phone / PC browser  --  http://<board>:7000
+          |
+          v
+ +---------------------------------------+            +---------------------------------------+
+ | Qualcomm QRB2210 - Linux (python/)    |   Bridge   | STM32U585 - Zephyr MCU (sketch/)      |
+ |                                       |  MsgPack   |                                       |
+ | web server :7000, firmware-dev's app  |  RPC over  | robot core: gaits, moves, 200 Hz      |
+ | forwards /v1/robot /v1/studio         | <--------> |   servo frames, rest, look, joystick  |
+ |   /v1/policy to the MCU               | /dev/ttyHS1| servo bus SPI2 4 MHz, Servo Studio    |
+ | settings: nvs.json                    |  460800 Bd | IMU BMI270 + BMM150, battery          |
+ | RL networks (numpy, full weights)     |            | LCD face (LVGL 9.5), GIFs from RAM    |
+ | TrajOpt / Character move tables       |            | the ESP's /v1/robot /studio /policy   |
+ | GIF files, Display page               |            |   HTTP handlers                       |
+ | Wi-Fi / AP, system pages, diagnostics |            | RL runner: ticks, guards, stops       |
+ +---------------------------------------+            | settings copy in flash (boots alone)  |
+                                                      +---------------------------------------+
+ +---------------------------------------+                              |
+ | ESP32-S3 on the MP4 board - IDLE      |    same wires    +---------------------------------------+
+ | esp_idle/: its pins float,            | - - - - - - - -  | MP4 board: 4 servo boards (AT32),     |
+ | the rails stay powered                |                  | IMU, LCD, battery                     |
+ +---------------------------------------+                  +---------------------------------------+
+```
+
+### Linux (Qualcomm QRB2210, Debian) - `python/`, an App Lab app
+
+| Part | File | Does |
+|---|---|---|
+| Web server | `main.py`, `esp_api.py` | serves firmware-dev's web app (pwa-claw `www/`, here `assets/`) at port 7000 |
+| Robot, Studio, RL routes | `esp_api.py` | forwards `/v1/robot/*`, `/v1/studio/*`, `/v1/policy*` to the MCU (`mp_http`); the MCU answers them |
+| Own routes | `esp_api.py` | `/v1/wifi/*`, `/v1/system/stats`, control scheme, agent permissions, chat websocket, `/unoq/*` diagnostics |
+| Display page | `display_api.py` | `/v1/display`; keeps the GIF files (`python/display_gifs/`, uploads in `display/`) and sends the chosen one to the MCU |
+| Settings ("NVS") | `nvs_store.py` -> `nvs.json` | calibration, config, current caps, rest timer, display, controller scheme; sent to the MCU at start |
+| Move tables | `mcu_link.py`, `tj_tables.bin` | TrajOpt / Character move rows, streamed to the MCU while a move plays |
+| RL networks | `policy_net.py`, `python/policies/*.mpxp` | evaluates the networks (numpy, float weights) for the MCU, once per 20 ms step |
+| Link supervisor | `mcu_link.py` | hello, settings push, the IP for the screen, the MCU's log lines |
+| Wi-Fi like the ESP | `tools/mpx_wifi.py`, `mpx-wifi.service` | joins saved networks; with none, opens the AP MPX-Dog-XXXXXX at 192.168.2.1 |
+| Autostart | `tools/mpx_start.sh` (cron @reboot) | starts the app; re-flashes the MCU only if the app cannot reach it within a minute |
+
+### MCU (STM32U585, Zephyr) - `sketch/`, flashed with arduino-cli (static mode)
+
+firmware-dev's own C/C++ (copied by `tools/port_from_esp.py`); `shim_esp.cpp`
+maps the ESP-IDF calls (FreeRTOS tasks, esp_timer, NVS) onto Zephyr threads.
+~400 KB of code, run from the 768 KB flash partition, starting at power-on.
+
+| Part | File | Does |
+|---|---|---|
+| Robot core | `robot.cpp`, `moves_mpe_inc.h`, `stanford_gait.cpp`, `stanford_kinematics.cpp` | every gait and move, 200 Hz servo frames, power / rest, look, joystick, calibration offsets |
+| Servo bus | `driver_board.c`, `spi_port.cpp` | AT32 protocol on SPI2 at 4 MHz, the boot check of the four boards, Servo Studio parameters |
+| IMU | `imu.cpp`, `imu_remap.cpp`, `bmi270.c`, `bmm150.c` | BMI270 + BMM150 on I2C2, remapped to firmware-dev's board frame |
+| Battery | `battery.cpp` | battery voltage |
+| LCD face | `cap_display*.c`, `display_hw.cpp`, `mcu_display.cpp`, `gif_store.cpp`, LVGL 9.5 | ST7789 face, emotions, text, boot screens, GIFs played from RAM |
+| HTTP handlers | `mcu_http.cpp` (+ `_routes_inc.h`, `_policy_inc.h`) | the ESP's `/v1/robot`, `/v1/studio`, `/v1/policy` handlers, on the Bridge thread |
+| RL runner | `policy_run.cpp`, `policy_core.c`, `policy_files.c` | 200 Hz ticks, observations, history, decoder, every guard and stop, get-up, keep up, stairs (policy files kept without weights) |
+| RL network call | `policy_remote.cpp` | each 20 ms step: observation to Linux, 12 actions back |
+| Move rows | `tj_stream.cpp` | receives the TrajOpt / Character rows while a move plays |
+| Settings copy | `nvs_cache.cpp` | `nvs.json` copied into the MCU's flash: the robot stands up before Linux boots |
+
+### ESP32-S3 (on the MP4 board) - `esp_idle/`
+
+Does nothing: every pin wired to the UNO Q (servo SPI, the four chip selects, the
+IMU's I2C) is a floating input, so the UNO Q drives those wires. Flash it once with
+`idf.py set-target esp32s3` and `idf.py -p COMx flash`; flash firmware-dev again to
+go back to the ESP robot.
+
+### The Bridge: every call
+
+| Call | Direction | Carries |
+|---|---|---|
+| `mp_hello` | Linux -> MCU | sketch version, boards, SPI, IMU, LCD, GIF, free RAM |
+| `mp_nvs` ... `mp_nvs_done` | Linux -> MCU | the saved settings at start |
+| `mp_nvs_save` | MCU -> Linux | a setting changed on the robot, written to `nvs.json` |
+| `mp_http`, `mp_http_more` | Linux -> MCU | a forwarded web request; the reply, in pieces when long |
+| `mp_net` | Linux -> MCU | the IP / Wi-Fi state under the eyes |
+| `mp_tj_want` / `mp_tj_push` | MCU asks, Linux pushes | move rows while a move plays |
+| `mp_gif_want` / `mp_gif_begin`, `_put`, `_end` | MCU asks, Linux pushes | a GIF into the MCU's RAM |
+| `pol_obs_put`, `pol_fwd` | MCU -> Linux | one RL step: newest observation in, 12 actions back |
+| `mp_spi`, `mp_imu`, `mp_imu_map` | Linux -> MCU | diagnostics: servo bus clock, IMU readout, IMU mount map |
+| `mp_log` | MCU -> Linux | the robot's log lines (`/unoq/log`) |
+
+If Linux is late or gone, the MCU still keeps the robot safe: the guards and
+stops are all on the MCU, and an RL run without an answer stops by itself.
+
 ## Install / update
 
 1. **Once: the Bridge at 460800 baud.** The face's GIFs and the RL policy need
